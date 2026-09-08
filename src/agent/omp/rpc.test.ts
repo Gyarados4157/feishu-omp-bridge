@@ -83,6 +83,7 @@ describe('translateOmpFrame', () => {
       type: 'turn_end',
       message: { usage: { input: 10, output: 5, cost: { total: 0.01 } } },
     })).toEqual([
+      { type: 'turn_end' },
       { type: 'usage', inputTokens: 10, outputTokens: 5, costUsd: 0.01 },
     ]);
 

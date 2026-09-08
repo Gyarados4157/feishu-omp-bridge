@@ -459,7 +459,12 @@ async function submitToActiveRun(deps: {
   const prompt = buildPrompt([msg], attachments, quotes);
   const trimmed = msg.content.trimStart();
   const kind = trimmed.startsWith('!') ? 'steer' : 'follow_up';
-  return activeRuns.submitPrompt(scope, kind, prompt, imagePaths);
+  const submitted = await activeRuns.submitPrompt(scope, kind, prompt, imagePaths);
+  // The follow-up turn's answer must land in a NEW reply window threaded to
+  // this message, not appended to the previous reply. Queue the target so the
+  // next window (opened on `turn_end`) replies to it.
+  if (submitted) activeRuns.queueReplyTarget(scope, msg.messageId);
+  return submitted;
 }
 
 interface RunBatchDeps {
@@ -596,12 +601,131 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     return { ...state, blocks: state.blocks.filter((b) => b.kind !== 'tool') };
   };
 
-  // For topic groups: thread the reply so it lands in the same topic as the
-  // user's message. Otherwise the SDK posts at top level and the user's
-  // topic discussion breaks visually.
-  const sendOpts = {
-    replyTo: lastMsg.messageId,
-    ...(mode === 'topic' && threadId ? { replyInThread: true } : {}),
+  // Per-turn reply windows. The whole run still flows through ONE agent
+  // process — no interrupt — but each `turn_end` finalizes the current
+  // streaming card and the next turn's output opens a fresh one. A follow-up
+  // answer therefore lands in its own card, threaded to the follow-up
+  // message instead of appending to the previous reply.
+  const threadOpts = mode === 'topic' && threadId ? { replyInThread: true } : {};
+
+  interface StreamCtrl {
+    setContent(content: string): Promise<void>;
+    update(card: object): Promise<void>;
+  }
+
+  interface StreamWindow {
+    /** Resolves once the SDK hands over the live stream controller. */
+    ctrl: Promise<StreamCtrl>;
+    /** Resolves when the window's card has been finalized. */
+    done: Promise<{ messageId: string }>;
+    /** End the producer so the SDK finalizes (completes) this window. */
+    finish: () => void;
+  }
+
+  const openWindow = (replyTo: string, initialCard: object): StreamWindow => {
+    let finish!: () => void;
+    let resolveCtrl!: (ctrl: StreamCtrl) => void;
+    let rejectCtrl!: (err: unknown) => void;
+    const ctrlGate = new Promise<StreamCtrl>((res, rej) => {
+      resolveCtrl = res;
+      rejectCtrl = rej;
+    });
+    const gate = new Promise<void>((res) => {
+      finish = res;
+    });
+    const done = (async () => {
+      try {
+        if (replyMode === 'card') {
+          return await channel.stream(
+            chatId,
+            {
+              card: {
+                initial: initialCard,
+                producer: async (ctrl) => {
+                  resolveCtrl(ctrl as unknown as StreamCtrl);
+                  await gate;
+                },
+              },
+            },
+            { replyTo, ...threadOpts },
+          );
+        }
+        return await channel.stream(
+          chatId,
+          {
+            markdown: async (ctrl) => {
+              resolveCtrl(ctrl as unknown as StreamCtrl);
+              await gate;
+            },
+          },
+          { replyTo, ...threadOpts },
+        );
+      } catch (err) {
+        rejectCtrl(err);
+        throw err;
+      }
+    })();
+    // Observe rejection so a window abandoned after a flush error doesn't
+    // surface as an unhandled promise rejection.
+    done.catch(() => {
+      /* observed */
+    });
+    return { ctrl: ctrlGate, done, finish };
+  };
+
+  // Merge the per-window content (current turn's blocks/reasoning) with the
+  // live run status (footer / terminal / ui) for rendering.
+  const renderWindowState = (view: RunState, live: RunState): RunState => ({
+    ...view,
+    footer: live.footer,
+    terminal: live.terminal,
+    ui: live.ui,
+    errorMsg: live.errorMsg,
+    idleTimeoutMinutes: live.idleTimeoutMinutes,
+  });
+
+  let window: StreamWindow | undefined;
+  let windowFailed = false;
+
+  const flushView = async (view: RunState, live: RunState): Promise<void> => {
+    if (windowFailed) return;
+    const rendered = renderWindowState(view, live);
+    if (!window) {
+      // Only auto-open a fresh window when there is content to show — a
+      // bare terminal flush right after `turn_end` must not spawn an empty
+      // "已完成" card.
+      const hasContent = view.blocks.length > 0 || view.reasoning.content.length > 0;
+      if (!hasContent && live.terminal !== 'running') return;
+      const replyTo = handle.pendingReplyTargets.shift() ?? lastMsg.messageId;
+      window = openWindow(
+        replyTo,
+        renderCard({ ...rendered, blocks: [], reasoning: { content: '', active: false } }),
+      );
+    }
+    try {
+      const ctrl = await window.ctrl;
+      if (replyMode === 'card') {
+        await ctrl.update(renderCard(filterForPrefs(rendered)));
+      } else {
+        await ctrl.setContent(renderText(filterForPrefs(rendered)));
+      }
+    } catch (err) {
+      windowFailed = true;
+      log.fail('window', err);
+    }
+  };
+
+  const finalizeWindow = async (): Promise<void> => {
+    const seg = window;
+    window = undefined;
+    if (!seg) return;
+    seg.finish();
+    try {
+      await seg.done;
+    } catch (err) {
+      windowFailed = true;
+      log.fail('window', err);
+    }
   };
 
   const uiCards = new Map<string, { messageId: string; title: string }>();
@@ -640,44 +764,24 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     replyMode === 'card' ? undefined : await addWorkingReaction(channel, lastMsg.messageId);
 
   try {
-    if (replyMode === 'card') {
-      await channel.stream(
-        chatId,
-        {
-          card: {
-            initial: renderCard(initialState),
-            producer: async (ctrl) => {
-              await processAgentStream(handle, sessions, scope, cwd, idleTimeoutMs, async (state) => {
-                await ctrl.update(renderCard(filterForPrefs(state)));
-              }, uiHooks);
-            },
-          },
-        },
-        sendOpts,
-      );
-    } else if (replyMode === 'markdown') {
-      await channel.stream(
-        chatId,
-        {
-          markdown: async (ctrl) => {
-            await processAgentStream(handle, sessions, scope, cwd, idleTimeoutMs, async (state) => {
-              await ctrl.setContent(renderText(filterForPrefs(state)));
-            }, uiHooks);
-          },
-        },
-        sendOpts,
-      );
+    if (replyMode === 'card' || replyMode === 'markdown') {
+      // Eager window 1 — the placeholder card shows before the first token,
+      // matching the pre-window streaming behavior.
+      window = openWindow(lastMsg.messageId, renderCard(initialState));
+      await processAgentStream(handle, sessions, scope, cwd, idleTimeoutMs, flushView, uiHooks, finalizeWindow);
+      // Close the last window (no-op if the final `turn_end` already did).
+      await finalizeWindow();
     } else {
       // text mode: drain the agent stream without sending anything during
       // the run, then post the final rendered text once as a plain markdown
       // (msg_type=post) message — no card, no streaming, no typewriter.
       let finalState: RunState = initialState;
-      await processAgentStream(handle, sessions, scope, cwd, idleTimeoutMs, async (state) => {
-        finalState = state;
+      await processAgentStream(handle, sessions, scope, cwd, idleTimeoutMs, async (_view, live) => {
+        finalState = live;
       }, uiHooks);
       const body = renderText(filterForPrefs(finalState));
       if (body.trim()) {
-        await channel.send(chatId, { markdown: body }, sendOpts);
+        await channel.send(chatId, { markdown: body }, { replyTo: lastMsg.messageId, ...threadOpts });
       }
     }
   } catch (err) {
@@ -692,8 +796,15 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
 
 /**
  * Drive the agent's event stream into a stateful RunState, calling `flush`
- * on every state transition. Used by both card and markdown reply modes —
- * the only difference between the two is what `flush` does with the state.
+ * on every state transition.
+ *
+ * `flush` receives two states:
+ *  - `view`: the CURRENT turn's content (blocks + reasoning), reset at every
+ *    `turn_end` — used to render per-turn reply windows;
+ *  - `live`: the authoritative run state (footer / terminal / ui / errors),
+ *    shared across turns.
+ * When `onTurnEnd` is provided it is invoked at each `turn_end` so the caller
+ * can finalize the current reply window before the next turn starts.
  */
 async function processAgentStream(
   handle: RunHandle,
@@ -701,10 +812,14 @@ async function processAgentStream(
   scope: string,
   cwd: string,
   idleTimeoutMs: number | undefined,
-  flush: (state: RunState) => Promise<void>,
+  flush: (view: RunState, live: RunState) => Promise<void>,
   hooks?: AgentStreamHooks,
+  onTurnEnd?: () => Promise<void>,
 ): Promise<void> {
   let state: RunState = initialState;
+  // Per-turn render accumulation. Reset at `turn_end` so the next turn's
+  // content renders into a fresh window instead of the previous one.
+  let view: RunState = initialState;
 
   // Idle watchdog: OMP going silent for `idleTimeoutMs` is treated as
   // "presumed hung", we stop() and surface a timeout marker on the card.
@@ -777,6 +892,14 @@ async function processAgentStream(
         }
         continue;
       }
+      if (evt.type === 'turn_end') {
+        // Turn boundary — finalize the current reply window. The next
+        // visible event opens a fresh one (threaded to the message that
+        // triggered the turn; see runAgentBatch.flushView).
+        view = initialState;
+        await onTurnEnd?.();
+        continue;
+      }
       if (evt.type === 'ui_request') {
         await hooks?.onUiRequest(evt.request);
       } else if (evt.type === 'ui_cancel') {
@@ -786,10 +909,11 @@ async function processAgentStream(
       const prevTerminal = state.terminal;
       const prevFooter = state.footer;
       state = reduce(state, evt);
+      view = reduce(view, evt);
       if (state.footer !== prevFooter || state.terminal !== prevTerminal) {
         log.info('card', 'transition', { footer: state.footer, terminal: state.terminal });
       }
-      await flush(state);
+      await flush(view, state);
       // Stop iterating as soon as we have a terminal state. Some OMP
       // RPC runs may leave stdout open briefly after agent_end, which
       // would leave the for-await waiting forever otherwise.
@@ -814,7 +938,7 @@ async function processAgentStream(
     }
   }
   log.info('card', 'final', { terminal: state.terminal, interrupted: handle.interrupted });
-  await flush(state);
+  await flush(view, state);
     // Reap the subprocess. Two regimes:
   //  - Interrupted (user /stop, idle watchdog, disconnect): stop() was already
   //    fire-and-forgotten by whoever set handle.interrupted; this awaits it.

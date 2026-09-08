@@ -48,4 +48,18 @@ describe('run-state OMP UI integration', () => {
     expect(updated.blocks[0]).toMatchObject({ kind: 'tool', tool: { output: 'working', status: 'running' } });
     expect(done.blocks[0]).toMatchObject({ kind: 'tool', tool: { output: 'done', status: 'done' } });
   });
+  it('closes streaming text at turn_end so the next turn starts a fresh block', () => {
+    const streamed = reduce(reduce(initialState, { type: 'text', delta: 'first' }), {
+      type: 'text',
+      delta: ' answer',
+    });
+    expect(streamed.blocks.at(-1)).toMatchObject({ kind: 'text', content: 'first answer', streaming: true });
+
+    const turned = reduce(streamed, { type: 'turn_end' });
+    expect(turned.blocks.at(-1)).toMatchObject({ kind: 'text', content: 'first answer', streaming: false });
+
+    const next = reduce(turned, { type: 'text', delta: 'second' });
+    expect(next.blocks).toHaveLength(2);
+    expect(next.blocks[1]).toMatchObject({ kind: 'text', content: 'second', streaming: true });
+  });
 });

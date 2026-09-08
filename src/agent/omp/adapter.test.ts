@@ -58,6 +58,7 @@ for await (const line of rl) {
     await expect(collect(run.events)).resolves.toEqual([
       { type: 'system', sessionId: 'session-1', model: 'test/model' },
       { type: 'text', delta: 'pong' },
+      { type: 'turn_end' },
       { type: 'usage', inputTokens: 1, outputTokens: 2, costUsd: undefined },
       { type: 'done' },
     ]);

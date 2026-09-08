@@ -5,13 +5,24 @@ export interface RunHandle {
   interrupted: boolean;
   pendingUiRequests: Set<string>;
   onUiSettled?: () => void;
+  /**
+   * Feishu message ids that triggered follow-up turns. Each new reply window
+   * (one per agent turn) consumes one as its reply target so the answer
+   * threads to the message that asked for it.
+   */
+  pendingReplyTargets: string[];
 }
 
 export class ActiveRuns {
   private readonly handles = new Map<string, RunHandle>();
 
   register(chatId: string, run: AgentRun): RunHandle {
-    const handle: RunHandle = { run, interrupted: false, pendingUiRequests: new Set() };
+    const handle: RunHandle = {
+      run,
+      interrupted: false,
+      pendingUiRequests: new Set(),
+      pendingReplyTargets: [],
+    };
     this.handles.set(chatId, handle);
     return handle;
   }
@@ -52,6 +63,14 @@ export class ActiveRuns {
   submitPrompt(chatId: string, kind: 'steer' | 'follow_up', message: string, imagePaths?: string[]): Promise<boolean> {
     const h = this.handles.get(chatId);
     return h?.run.submitPrompt?.(kind, message, imagePaths) ?? Promise.resolve(false);
+  }
+  /**
+   * Record the Feishu message that triggered a follow-up turn. The running
+   * stream consumes one target per new reply window (turn), so the answer
+   * threads to the message that asked for it.
+   */
+  queueReplyTarget(chatId: string, messageId: string): void {
+    this.handles.get(chatId)?.pendingReplyTargets.push(messageId);
   }
 
   async stopAll(): Promise<void> {

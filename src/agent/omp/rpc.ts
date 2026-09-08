@@ -130,6 +130,7 @@ export function* translateOmpFrame(raw: unknown): Generator<AgentEvent> {
       }
       return;
     case 'turn_end':
+      yield { type: 'turn_end' };
       if (isRecord(frame.message) && isRecord(frame.message.usage)) {
         yield usageEvent(frame.message.usage as OmpUsage);
       }
