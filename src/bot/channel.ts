@@ -50,6 +50,13 @@ import { fetchQuotedContext, renderQuotedBlock, type QuotedContext } from './quo
 import { addWorkingReaction, removeReaction } from './reaction';
 
 const DEBOUNCE_MS = 600;
+// Feishu CardKit streaming (markdown mode) cards auto-close ~10 minutes
+// after creation — SDK note: "Feishu auto-closes after 10min regardless".
+// Content updates after that are silently dropped (accepted, never
+// rendered), while bridge logs stay perfectly clean. Long-lived agent runs
+// (CI waits, background jobs, idle user) routinely cross that cap, so
+// rotate markdown windows well before it.
+const STREAMING_WINDOW_MAX_AGE_MS = 5 * 60_000;
 
 // Lark SDK logs API errors at error level even when the caller catches them.
 // These specific codes are EXPECTED in our flow (wiki-node lookup that
@@ -624,6 +631,9 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     finish: () => void;
     /** True once any content has been painted into the window. */
     painted: boolean;
+    /** Original message this window's reply threads to — kept across
+     * time-based rotation so rollover cards form one continuous reply. */
+    replyTo: string;
   }
 
   const openWindow = (replyTo: string, initialCard: object): StreamWindow => {
@@ -674,7 +684,8 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     done.catch(() => {
       /* observed */
     });
-    return { ctrl: ctrlGate, done, finish, painted: false };
+    windowOpenedAt = Date.now();
+    return { ctrl: ctrlGate, done, finish, painted: false, replyTo };
   };
 
   // Merge the per-window content (current turn's blocks/reasoning) with the
@@ -690,6 +701,21 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
 
   let window: StreamWindow | undefined;
   let windowFailed = false;
+  let windowOpenedAt = 0;
+  // End a window the same way the final flush does: release the producer,
+  // wait for the SDK to complete the card, and recall it if it never
+  // received content. Used by finalizeWindow and time-based rotation.
+  const finishSeg = async (seg: StreamWindow): Promise<void> => {
+    seg.finish();
+    const { messageId } = await seg.done;
+    if (!seg.painted) {
+      // The window was opened (eager placeholder) but never received any
+      // content — e.g. the run was interrupted before the first token.
+      // Completing it would surface a "(no content)" card; recall it.
+      log.info('window', 'recall-unpainted', { messageId });
+      await channel.recallMessage(messageId);
+    }
+  };
 
   const flushView = async (view: RunState, live: RunState): Promise<void> => {
     if (windowFailed) return;
@@ -704,6 +730,20 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         replyTo,
         renderCard({ ...rendered, blocks: [], reasoning: { content: '', active: false } }),
       );
+    } else if (replyMode === 'markdown' && Date.now() - windowOpenedAt > STREAMING_WINDOW_MAX_AGE_MS) {
+      // Over-age streaming card: CardKit closed it ~10 min after creation and
+      // later updates are silently dropped, so a long run would freeze the
+      // card and lose its final answer. Finalize it and continue in a fresh
+      // window threaded to the same original message.
+      const seg = window;
+      window = undefined;
+      try {
+        await finishSeg(seg);
+      } catch (err) {
+        log.fail('window', err, { step: 'rotate-finalize' });
+      }
+      log.info('window', 'rotated', { ageMs: Date.now() - windowOpenedAt });
+      window = openWindow(seg.replyTo, renderCard(initialState));
     }
     try {
       const ctrl = await window.ctrl;
@@ -723,16 +763,8 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     const seg = window;
     window = undefined;
     if (!seg) return;
-    seg.finish();
     try {
-      const { messageId } = await seg.done;
-      if (!seg.painted) {
-        // The window was opened (eager placeholder) but never received any
-        // content — e.g. the run was interrupted before the first token.
-        // Completing it would surface a "(no content)" card; recall it.
-        log.info('window', 'recall-unpainted', { messageId });
-        await channel.recallMessage(messageId);
-      }
+      await finishSeg(seg);
     } catch (err) {
       windowFailed = true;
       log.fail('window', err);
