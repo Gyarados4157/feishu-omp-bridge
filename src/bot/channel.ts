@@ -601,11 +601,13 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     return { ...state, blocks: state.blocks.filter((b) => b.kind !== 'tool') };
   };
 
-  // Per-turn reply windows. The whole run still flows through ONE agent
-  // process — no interrupt — but each `turn_end` finalizes the current
-  // streaming card and the next turn's output opens a fresh one. A follow-up
-  // answer therefore lands in its own card, threaded to the follow-up
-  // message instead of appending to the previous reply.
+  // Per-user-message reply windows. The whole run still flows through ONE
+  // agent process — no interrupt — but when a follow-up prompt is queued
+  // (`pendingReplyTargets`), the current streaming card is finalized and the
+  // follow-up's answer opens a fresh one, threaded to the follow-up message
+  // instead of appending to the previous reply. OMP's `turn_end` is a
+  // model-iteration boundary (tool-loop round-trip), not a user boundary, so
+  // it is deliberately ignored by the window machinery.
   const threadOpts = mode === 'topic' && threadId ? { replyInThread: true } : {};
 
   interface StreamCtrl {
@@ -620,6 +622,8 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     done: Promise<{ messageId: string }>;
     /** End the producer so the SDK finalizes (completes) this window. */
     finish: () => void;
+    /** True once any content has been painted into the window. */
+    painted: boolean;
   }
 
   const openWindow = (replyTo: string, initialCard: object): StreamWindow => {
@@ -670,7 +674,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     done.catch(() => {
       /* observed */
     });
-    return { ctrl: ctrlGate, done, finish };
+    return { ctrl: ctrlGate, done, finish, painted: false };
   };
 
   // Merge the per-window content (current turn's blocks/reasoning) with the
@@ -691,11 +695,10 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     if (windowFailed) return;
     const rendered = renderWindowState(view, live);
     if (!window) {
-      // Only auto-open a fresh window when there is content to show — a
-      // bare terminal flush right after `turn_end` must not spawn an empty
-      // "已完成" card.
+      // Only ever open a window once there is content to show. Opening one
+      // early risks a "(no content)" card when it is finalized.
       const hasContent = view.blocks.length > 0 || view.reasoning.content.length > 0;
-      if (!hasContent && live.terminal !== 'running') return;
+      if (!hasContent) return;
       const replyTo = handle.pendingReplyTargets.shift() ?? lastMsg.messageId;
       window = openWindow(
         replyTo,
@@ -709,6 +712,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       } else {
         await ctrl.setContent(renderText(filterForPrefs(rendered)));
       }
+      window.painted = true;
     } catch (err) {
       windowFailed = true;
       log.fail('window', err);
@@ -721,7 +725,14 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     if (!seg) return;
     seg.finish();
     try {
-      await seg.done;
+      const { messageId } = await seg.done;
+      if (!seg.painted) {
+        // The window was opened (eager placeholder) but never received any
+        // content — e.g. the run was interrupted before the first token.
+        // Completing it would surface a "(no content)" card; recall it.
+        log.info('window', 'recall-unpainted', { messageId });
+        await channel.recallMessage(messageId);
+      }
     } catch (err) {
       windowFailed = true;
       log.fail('window', err);
@@ -766,10 +777,12 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   try {
     if (replyMode === 'card' || replyMode === 'markdown') {
       // Eager window 1 — the placeholder card shows before the first token,
-      // matching the pre-window streaming behavior.
+      // matching the pre-window streaming behavior. If the run ends before
+      // anything was painted, finalizeWindow recalls it instead of surfacing
+      // a "(no content)" card.
       window = openWindow(lastMsg.messageId, renderCard(initialState));
       await processAgentStream(handle, sessions, scope, cwd, idleTimeoutMs, flushView, uiHooks, finalizeWindow);
-      // Close the last window (no-op if the final `turn_end` already did).
+      // Close the last window (no-op if the final follow-up boundary did).
       await finalizeWindow();
     } else {
       // text mode: drain the agent stream without sending anything during
@@ -799,12 +812,14 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
  * on every state transition.
  *
  * `flush` receives two states:
- *  - `view`: the CURRENT turn's content (blocks + reasoning), reset at every
- *    `turn_end` — used to render per-turn reply windows;
+ *  - `view`: the current window's content (blocks + reasoning), reset when a
+ *    new user prompt is pending (see `onBoundary`);
  *  - `live`: the authoritative run state (footer / terminal / ui / errors),
- *    shared across turns.
- * When `onTurnEnd` is provided it is invoked at each `turn_end` so the caller
- * can finalize the current reply window before the next turn starts.
+ *    shared across all windows of the run.
+ * OMP emits `turn_end` per model iteration (tool-loop round-trip), NOT per
+ * user message, so turn_end is ignored here — window boundaries are driven
+ * by the caller via `onBoundary` (fired once a follow-up prompt has been
+ * queued on the handle).
  */
 async function processAgentStream(
   handle: RunHandle,
@@ -814,7 +829,7 @@ async function processAgentStream(
   idleTimeoutMs: number | undefined,
   flush: (view: RunState, live: RunState) => Promise<void>,
   hooks?: AgentStreamHooks,
-  onTurnEnd?: () => Promise<void>,
+  onBoundary?: () => Promise<void>,
 ): Promise<void> {
   let state: RunState = initialState;
   // Per-turn render accumulation. Reset at `turn_end` so the next turn's
@@ -878,6 +893,16 @@ async function processAgentStream(
       }
       armOrPauseIdle();
 
+      // New-user-prompt boundary: a follow-up was queued (submitToActiveRun
+      // enqueues the reply target synchronously after the prompt write, so
+      // the queue is non-empty before OMP can emit any event for the
+      // follow-up turn). Finalize the current reply window and reset the
+      // per-window view so this event starts the follow-up turn fresh.
+      if (handle.pendingReplyTargets.length > 0) {
+        view = initialState;
+        await onBoundary?.();
+      }
+
       if (evt.type === 'system') {
         if (evt.sessionId) {
           const effectiveCwd = evt.cwd ?? cwd;
@@ -893,11 +918,11 @@ async function processAgentStream(
         continue;
       }
       if (evt.type === 'turn_end') {
-        // Turn boundary — finalize the current reply window. The next
-        // visible event opens a fresh one (threaded to the message that
-        // triggered the turn; see runAgentBatch.flushView).
-        view = initialState;
-        await onTurnEnd?.();
+        // OMP emits turn_end at every model iteration (tool-loop
+        // round-trips), NOT at user-message boundaries — splitting reply
+        // windows here would fragment one answer into many cards and create
+        // empty "(no content)" windows for content-less iterations. Ignored:
+        // window boundaries come from queued follow-up prompts above.
         continue;
       }
       if (evt.type === 'ui_request') {
