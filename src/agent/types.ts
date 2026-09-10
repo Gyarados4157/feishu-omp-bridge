@@ -78,8 +78,7 @@ export type AgentEvent =
   | { type: 'ui_editor_text'; text: string }
   | { type: 'ui_open_url'; url: string; instructions?: string }
   | { type: 'done'; sessionId?: string }
-  | { type: 'error'; message: string }
-  | { type: 'turn_end' };
+  | { type: 'error'; message: string };
 
 export interface AgentRunOptions {
   prompt: string;

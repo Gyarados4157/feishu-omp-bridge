@@ -468,8 +468,8 @@ async function submitToActiveRun(deps: {
   const kind = trimmed.startsWith('!') ? 'steer' : 'follow_up';
   const submitted = await activeRuns.submitPrompt(scope, kind, prompt, imagePaths);
   // The follow-up turn's answer must land in a NEW reply window threaded to
-  // this message, not appended to the previous reply. Queue the target so the
-  // next window (opened on `turn_end`) replies to it.
+  // this message, not appended to the previous reply. Queue it so that
+  // window's reply targets this message.
   if (submitted) activeRuns.queueReplyTarget(scope, msg.messageId);
   return submitted;
 }
@@ -612,9 +612,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   // agent process — no interrupt — but when a follow-up prompt is queued
   // (`pendingReplyTargets`), the current streaming card is finalized and the
   // follow-up's answer opens a fresh one, threaded to the follow-up message
-  // instead of appending to the previous reply. OMP's `turn_end` is a
-  // model-iteration boundary (tool-loop round-trip), not a user boundary, so
-  // it is deliberately ignored by the window machinery.
+  // instead of appending to the previous reply.
   const threadOpts = mode === 'topic' && threadId ? { replyInThread: true } : {};
 
   interface StreamCtrl {
@@ -848,10 +846,8 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
  *    new user prompt is pending (see `onBoundary`);
  *  - `live`: the authoritative run state (footer / terminal / ui / errors),
  *    shared across all windows of the run.
- * OMP emits `turn_end` per model iteration (tool-loop round-trip), NOT per
- * user message, so turn_end is ignored here — window boundaries are driven
- * by the caller via `onBoundary` (fired once a follow-up prompt has been
- * queued on the handle).
+ * Window boundaries are driven by the caller via `onBoundary` (fired once a
+ * follow-up prompt has been queued on the handle).
  */
 async function processAgentStream(
   handle: RunHandle,
@@ -864,8 +860,8 @@ async function processAgentStream(
   onBoundary?: () => Promise<void>,
 ): Promise<void> {
   let state: RunState = initialState;
-  // Per-turn render accumulation. Reset at `turn_end` so the next turn's
-  // content renders into a fresh window instead of the previous one.
+  // Per-window render accumulation. Reset when a follow-up prompt is queued
+  // so the follow-up's answer starts in a fresh window.
   let view: RunState = initialState;
 
   // Idle watchdog: OMP going silent for `idleTimeoutMs` is treated as
@@ -947,14 +943,6 @@ async function processAgentStream(
         if (evt.costUsd !== undefined) {
           log.info('agent', 'usage', { costUsd: Number(evt.costUsd.toFixed(4)) });
         }
-        continue;
-      }
-      if (evt.type === 'turn_end') {
-        // OMP emits turn_end at every model iteration (tool-loop
-        // round-trips), NOT at user-message boundaries — splitting reply
-        // windows here would fragment one answer into many cards and create
-        // empty "(no content)" windows for content-less iterations. Ignored:
-        // window boundaries come from queued follow-up prompts above.
         continue;
       }
       if (evt.type === 'ui_request') {

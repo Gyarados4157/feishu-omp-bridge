@@ -177,11 +177,6 @@ export function reduce(state: RunState, evt: AgentEvent): RunState {
     case 'error': {
       return { ...state, terminal: 'error', errorMsg: evt.message, footer: null };
     }
-    // A turn boundary: stop accumulating into the last text block so the
-    // next turn's deltas start a fresh block (per-turn reply windows depend
-    // on clean block separation).
-    case 'turn_end':
-      return { ...state, blocks: closeStreamingText(state.blocks) };
 
     case 'done': {
       return {
