@@ -50,6 +50,13 @@ import { fetchQuotedContext, renderQuotedBlock, type QuotedContext } from './quo
 import { addWorkingReaction, removeReaction } from './reaction';
 
 const DEBOUNCE_MS = 600;
+// Feishu CardKit streaming (markdown mode) cards auto-close ~10 minutes
+// after creation — SDK note: "Feishu auto-closes after 10min regardless".
+// Content updates after that are silently dropped (accepted, never
+// rendered), while bridge logs stay perfectly clean. Long-lived agent runs
+// (CI waits, background jobs, idle user) routinely cross that cap, so
+// rotate markdown windows well before it.
+const STREAMING_WINDOW_MAX_AGE_MS = 5 * 60_000;
 
 // Lark SDK logs API errors at error level even when the caller catches them.
 // These specific codes are EXPECTED in our flow (wiki-node lookup that
@@ -459,7 +466,12 @@ async function submitToActiveRun(deps: {
   const prompt = buildPrompt([msg], attachments, quotes);
   const trimmed = msg.content.trimStart();
   const kind = trimmed.startsWith('!') ? 'steer' : 'follow_up';
-  return activeRuns.submitPrompt(scope, kind, prompt, imagePaths);
+  const submitted = await activeRuns.submitPrompt(scope, kind, prompt, imagePaths);
+  // The follow-up turn's answer must land in a NEW reply window threaded to
+  // this message, not appended to the previous reply. Queue it so that
+  // window's reply targets this message.
+  if (submitted) activeRuns.queueReplyTarget(scope, msg.messageId);
+  return submitted;
 }
 
 interface RunBatchDeps {
@@ -596,12 +608,165 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     return { ...state, blocks: state.blocks.filter((b) => b.kind !== 'tool') };
   };
 
-  // For topic groups: thread the reply so it lands in the same topic as the
-  // user's message. Otherwise the SDK posts at top level and the user's
-  // topic discussion breaks visually.
-  const sendOpts = {
-    replyTo: lastMsg.messageId,
-    ...(mode === 'topic' && threadId ? { replyInThread: true } : {}),
+  // Per-user-message reply windows. The whole run still flows through ONE
+  // agent process — no interrupt — but when a follow-up prompt is queued
+  // (`pendingReplyTargets`), the current streaming card is finalized and the
+  // follow-up's answer opens a fresh one, threaded to the follow-up message
+  // instead of appending to the previous reply.
+  const threadOpts = mode === 'topic' && threadId ? { replyInThread: true } : {};
+
+  interface StreamCtrl {
+    setContent(content: string): Promise<void>;
+    update(card: object): Promise<void>;
+  }
+
+  interface StreamWindow {
+    /** Resolves once the SDK hands over the live stream controller. */
+    ctrl: Promise<StreamCtrl>;
+    /** Resolves when the window's card has been finalized. */
+    done: Promise<{ messageId: string }>;
+    /** End the producer so the SDK finalizes (completes) this window. */
+    finish: () => void;
+    /** True once any content has been painted into the window. */
+    painted: boolean;
+    /** Original message this window's reply threads to — kept across
+     * time-based rotation so rollover cards form one continuous reply. */
+    replyTo: string;
+  }
+
+  const openWindow = (replyTo: string, initialCard: object): StreamWindow => {
+    let finish!: () => void;
+    let resolveCtrl!: (ctrl: StreamCtrl) => void;
+    let rejectCtrl!: (err: unknown) => void;
+    const ctrlGate = new Promise<StreamCtrl>((res, rej) => {
+      resolveCtrl = res;
+      rejectCtrl = rej;
+    });
+    const gate = new Promise<void>((res) => {
+      finish = res;
+    });
+    const done = (async () => {
+      try {
+        if (replyMode === 'card') {
+          return await channel.stream(
+            chatId,
+            {
+              card: {
+                initial: initialCard,
+                producer: async (ctrl) => {
+                  resolveCtrl(ctrl as unknown as StreamCtrl);
+                  await gate;
+                },
+              },
+            },
+            { replyTo, ...threadOpts },
+          );
+        }
+        return await channel.stream(
+          chatId,
+          {
+            markdown: async (ctrl) => {
+              resolveCtrl(ctrl as unknown as StreamCtrl);
+              await gate;
+            },
+          },
+          { replyTo, ...threadOpts },
+        );
+      } catch (err) {
+        rejectCtrl(err);
+        throw err;
+      }
+    })();
+    // Observe rejection so a window abandoned after a flush error doesn't
+    // surface as an unhandled promise rejection.
+    done.catch(() => {
+      /* observed */
+    });
+    windowOpenedAt = Date.now();
+    return { ctrl: ctrlGate, done, finish, painted: false, replyTo };
+  };
+
+  // Merge the per-window content (current turn's blocks/reasoning) with the
+  // live run status (footer / terminal / ui) for rendering.
+  const renderWindowState = (view: RunState, live: RunState): RunState => ({
+    ...view,
+    footer: live.footer,
+    terminal: live.terminal,
+    ui: live.ui,
+    errorMsg: live.errorMsg,
+    idleTimeoutMinutes: live.idleTimeoutMinutes,
+  });
+
+  let window: StreamWindow | undefined;
+  let windowFailed = false;
+  let windowOpenedAt = 0;
+  // End a window the same way the final flush does: release the producer,
+  // wait for the SDK to complete the card, and recall it if it never
+  // received content. Used by finalizeWindow and time-based rotation.
+  const finishSeg = async (seg: StreamWindow): Promise<void> => {
+    seg.finish();
+    const { messageId } = await seg.done;
+    if (!seg.painted) {
+      // The window was opened (eager placeholder) but never received any
+      // content — e.g. the run was interrupted before the first token.
+      // Completing it would surface a "(no content)" card; recall it.
+      log.info('window', 'recall-unpainted', { messageId });
+      await channel.recallMessage(messageId);
+    }
+  };
+
+  const flushView = async (view: RunState, live: RunState): Promise<void> => {
+    if (windowFailed) return;
+    const rendered = renderWindowState(view, live);
+    if (!window) {
+      // Only ever open a window once there is content to show. Opening one
+      // early risks a "(no content)" card when it is finalized.
+      const hasContent = view.blocks.length > 0 || view.reasoning.content.length > 0;
+      if (!hasContent) return;
+      const replyTo = handle.pendingReplyTargets.shift() ?? lastMsg.messageId;
+      window = openWindow(
+        replyTo,
+        renderCard({ ...rendered, blocks: [], reasoning: { content: '', active: false } }),
+      );
+    } else if (replyMode === 'markdown' && Date.now() - windowOpenedAt > STREAMING_WINDOW_MAX_AGE_MS) {
+      // Over-age streaming card: CardKit closed it ~10 min after creation and
+      // later updates are silently dropped, so a long run would freeze the
+      // card and lose its final answer. Finalize it and continue in a fresh
+      // window threaded to the same original message.
+      const seg = window;
+      window = undefined;
+      try {
+        await finishSeg(seg);
+      } catch (err) {
+        log.fail('window', err, { step: 'rotate-finalize' });
+      }
+      log.info('window', 'rotated', { ageMs: Date.now() - windowOpenedAt });
+      window = openWindow(seg.replyTo, renderCard(initialState));
+    }
+    try {
+      const ctrl = await window.ctrl;
+      if (replyMode === 'card') {
+        await ctrl.update(renderCard(filterForPrefs(rendered)));
+      } else {
+        await ctrl.setContent(renderText(filterForPrefs(rendered)));
+      }
+      window.painted = true;
+    } catch (err) {
+      windowFailed = true;
+      log.fail('window', err);
+    }
+  };
+
+  const finalizeWindow = async (): Promise<void> => {
+    const seg = window;
+    window = undefined;
+    if (!seg) return;
+    try {
+      await finishSeg(seg);
+    } catch (err) {
+      windowFailed = true;
+      log.fail('window', err);
+    }
   };
 
   const uiCards = new Map<string, { messageId: string; title: string }>();
@@ -640,44 +805,26 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     replyMode === 'card' ? undefined : await addWorkingReaction(channel, lastMsg.messageId);
 
   try {
-    if (replyMode === 'card') {
-      await channel.stream(
-        chatId,
-        {
-          card: {
-            initial: renderCard(initialState),
-            producer: async (ctrl) => {
-              await processAgentStream(handle, sessions, scope, cwd, idleTimeoutMs, async (state) => {
-                await ctrl.update(renderCard(filterForPrefs(state)));
-              }, uiHooks);
-            },
-          },
-        },
-        sendOpts,
-      );
-    } else if (replyMode === 'markdown') {
-      await channel.stream(
-        chatId,
-        {
-          markdown: async (ctrl) => {
-            await processAgentStream(handle, sessions, scope, cwd, idleTimeoutMs, async (state) => {
-              await ctrl.setContent(renderText(filterForPrefs(state)));
-            }, uiHooks);
-          },
-        },
-        sendOpts,
-      );
+    if (replyMode === 'card' || replyMode === 'markdown') {
+      // Eager window 1 — the placeholder card shows before the first token,
+      // matching the pre-window streaming behavior. If the run ends before
+      // anything was painted, finalizeWindow recalls it instead of surfacing
+      // a "(no content)" card.
+      window = openWindow(lastMsg.messageId, renderCard(initialState));
+      await processAgentStream(handle, sessions, scope, cwd, idleTimeoutMs, flushView, uiHooks, finalizeWindow);
+      // Close the last window (no-op if the final follow-up boundary did).
+      await finalizeWindow();
     } else {
       // text mode: drain the agent stream without sending anything during
       // the run, then post the final rendered text once as a plain markdown
       // (msg_type=post) message — no card, no streaming, no typewriter.
       let finalState: RunState = initialState;
-      await processAgentStream(handle, sessions, scope, cwd, idleTimeoutMs, async (state) => {
-        finalState = state;
+      await processAgentStream(handle, sessions, scope, cwd, idleTimeoutMs, async (_view, live) => {
+        finalState = live;
       }, uiHooks);
       const body = renderText(filterForPrefs(finalState));
       if (body.trim()) {
-        await channel.send(chatId, { markdown: body }, sendOpts);
+        await channel.send(chatId, { markdown: body }, { replyTo: lastMsg.messageId, ...threadOpts });
       }
     }
   } catch (err) {
@@ -692,8 +839,15 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
 
 /**
  * Drive the agent's event stream into a stateful RunState, calling `flush`
- * on every state transition. Used by both card and markdown reply modes —
- * the only difference between the two is what `flush` does with the state.
+ * on every state transition.
+ *
+ * `flush` receives two states:
+ *  - `view`: the current window's content (blocks + reasoning), reset when a
+ *    new user prompt is pending (see `onBoundary`);
+ *  - `live`: the authoritative run state (footer / terminal / ui / errors),
+ *    shared across all windows of the run.
+ * Window boundaries are driven by the caller via `onBoundary` (fired once a
+ * follow-up prompt has been queued on the handle).
  */
 async function processAgentStream(
   handle: RunHandle,
@@ -701,10 +855,14 @@ async function processAgentStream(
   scope: string,
   cwd: string,
   idleTimeoutMs: number | undefined,
-  flush: (state: RunState) => Promise<void>,
+  flush: (view: RunState, live: RunState) => Promise<void>,
   hooks?: AgentStreamHooks,
+  onBoundary?: () => Promise<void>,
 ): Promise<void> {
   let state: RunState = initialState;
+  // Per-window render accumulation. Reset when a follow-up prompt is queued
+  // so the follow-up's answer starts in a fresh window.
+  let view: RunState = initialState;
 
   // Idle watchdog: OMP going silent for `idleTimeoutMs` is treated as
   // "presumed hung", we stop() and surface a timeout marker on the card.
@@ -763,6 +921,16 @@ async function processAgentStream(
       }
       armOrPauseIdle();
 
+      // New-user-prompt boundary: a follow-up was queued (submitToActiveRun
+      // enqueues the reply target synchronously after the prompt write, so
+      // the queue is non-empty before OMP can emit any event for the
+      // follow-up turn). Finalize the current reply window and reset the
+      // per-window view so this event starts the follow-up turn fresh.
+      if (handle.pendingReplyTargets.length > 0) {
+        view = initialState;
+        await onBoundary?.();
+      }
+
       if (evt.type === 'system') {
         if (evt.sessionId) {
           const effectiveCwd = evt.cwd ?? cwd;
@@ -786,10 +954,11 @@ async function processAgentStream(
       const prevTerminal = state.terminal;
       const prevFooter = state.footer;
       state = reduce(state, evt);
+      view = reduce(view, evt);
       if (state.footer !== prevFooter || state.terminal !== prevTerminal) {
         log.info('card', 'transition', { footer: state.footer, terminal: state.terminal });
       }
-      await flush(state);
+      await flush(view, state);
       // Stop iterating as soon as we have a terminal state. Some OMP
       // RPC runs may leave stdout open briefly after agent_end, which
       // would leave the for-await waiting forever otherwise.
@@ -814,7 +983,7 @@ async function processAgentStream(
     }
   }
   log.info('card', 'final', { terminal: state.terminal, interrupted: handle.interrupted });
-  await flush(state);
+  await flush(view, state);
     // Reap the subprocess. Two regimes:
   //  - Interrupted (user /stop, idle watchdog, disconnect): stop() was already
   //    fire-and-forgotten by whoever set handle.interrupted; this awaits it.

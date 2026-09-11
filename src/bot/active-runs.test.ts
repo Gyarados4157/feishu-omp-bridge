@@ -56,4 +56,22 @@ describe('ActiveRuns OMP UI routing', () => {
     expect(activeRuns.has('scope-1')).toBe(true);
     expect(prompts).toEqual([{ kind: 'follow_up', message: 'next', imagePaths: ['a.png'] }]);
   });
+  it('queues follow-up reply targets in submission order', () => {
+    const activeRuns = new ActiveRuns();
+    const run: AgentRun = {
+      events: emptyEvents(),
+      stop: async () => {},
+      waitForExit: async () => true,
+    };
+
+    const handle = activeRuns.register('scope-1', run);
+    activeRuns.queueReplyTarget('scope-1', 'msg-1');
+    activeRuns.queueReplyTarget('scope-1', 'msg-2');
+    expect(handle.pendingReplyTargets).toEqual(['msg-1', 'msg-2']);
+    expect(handle.pendingReplyTargets.shift()).toBe('msg-1');
+
+    // Unknown scope is a no-op.
+    expect(() => activeRuns.queueReplyTarget('missing', 'msg-3')).not.toThrow();
+    expect(handle.pendingReplyTargets).toEqual(['msg-2']);
+  });
 });
