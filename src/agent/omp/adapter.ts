@@ -6,6 +6,7 @@ import { log } from '../../core/logger';
 import type { AgentAdapter, AgentEvent, AgentHostTool, AgentHostUriScheme, AgentRun, AgentRunOptions, AgentUiResponse } from '../types';
 import { buildOmpArgs, buildOmpPrompt } from './args';
 import {
+  assistantMessageError,
   isReadyFrame,
   loadOmpImages,
   parseOmpJsonLine,
@@ -159,6 +160,7 @@ async function* createEventStream(
   let terminal = false;
   let sawReady = false;
   let promptSent = false;
+  let latestAssistantError: string | undefined;
   try {
     for await (const line of rl) {
       const parsed = parseOmpJsonLine(line);
@@ -202,6 +204,7 @@ async function* createEventStream(
         continue;
       }
 
+      latestAssistantError = updateLatestAssistantError(parsed, latestAssistantError);
 
       if (isHostToolCall(parsed)) {
         yield* handleHostToolCall(child, opts.hostTools ?? [], parsed);
@@ -216,8 +219,12 @@ async function* createEventStream(
         continue;
       }
       for (const event of translateOmpFrame(parsed)) {
-        yield event;
-        if (event.type === 'done' || event.type === 'error') terminal = true;
+        const translated =
+          event.type === 'done' && latestAssistantError && isRecord(parsed) && parsed.type === 'agent_end'
+            ? { type: 'error' as const, message: latestAssistantError }
+            : event;
+        yield translated;
+        if (translated.type === 'done' || translated.type === 'error') terminal = true;
       }
 
       if (terminal) {
@@ -240,6 +247,14 @@ async function* createEventStream(
     yield { type: 'error', message: 'omp exited before sending ready frame' };
   } else if (!terminal && !promptSent) {
     yield { type: 'error', message: 'omp exited before prompt was accepted' };
+  } else if (!terminal && promptSent) {
+    // A clean EOF is not a successful run when OMP accepted a prompt but
+    // never emitted a terminal agent_end. Treat it as a visible failure rather
+    // than letting the caller turn an empty stream into “未返回内容”.
+    yield {
+      type: 'error',
+      message: latestAssistantError ?? 'omp exited before terminal agent_end',
+    };
   }
 }
 
@@ -284,6 +299,27 @@ function waitForExitWithin(child: OmpChild, timeoutMs: number): Promise<boolean>
 function errorText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
+
+/**
+ * Keep the latest assistant message error until the terminal agent_end. OMP's
+ * RPC frame encoder may compact an agent_end frame after its message_end frame
+ * was already streamed, so looking only at agent_end.messages is not enough
+ * to preserve provider errors.
+ */
+function updateLatestAssistantError(raw: unknown, previous: string | undefined): string | undefined {
+  if (!isRecord(raw)) return previous;
+  if (raw.type === 'agent_start') return undefined;
+  if (
+    raw.type !== 'message_start' &&
+    raw.type !== 'message_end' &&
+    raw.type !== 'turn_end'
+  ) {
+    return previous;
+  }
+  if (!isRecord(raw.message) || raw.message.role !== 'assistant') return previous;
+  return raw.type === 'message_start' ? undefined : assistantMessageError(raw.message);
+}
+
 interface HostToolCallFrame {
   type: 'host_tool_call';
   id: string;

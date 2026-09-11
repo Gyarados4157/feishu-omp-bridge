@@ -4,6 +4,8 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { OmpAdapter } from './adapter';
 import type { AgentEvent } from '../types';
+import { renderCard } from '../../card/run-renderer';
+import { initialState, reduce } from '../../card/run-state';
 
 async function fakeOmp(source: string): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), 'omp-adapter-test-'));
@@ -62,6 +64,76 @@ for await (const line of rl) {
       { type: 'done' },
     ]);
     await expect(run.waitForExit(100)).resolves.toBe(true);
+  });
+
+  it('does not treat a non-terminal agent_end as the end of a run', async () => {
+    const binary = await fakeOmp(`
+import { createInterface } from 'node:readline';
+console.log(JSON.stringify({ type: 'ready' }));
+const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
+for await (const line of rl) {
+  const frame = JSON.parse(line);
+  if (frame.type === 'prompt') {
+    // OMP emits this while an async continuation is still scheduled. A client
+    // must keep reading until the later terminal agent_end.
+    console.log(JSON.stringify({ type: 'agent_end', messages: [], isTerminal: false }));
+    console.log(JSON.stringify({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'continued' } }));
+    console.log(JSON.stringify({ type: 'agent_end', messages: [], isTerminal: true }));
+  }
+}
+`);
+
+    const run = new OmpAdapter({ binary }).run({ prompt: 'ping', cwd: tmpdir() });
+
+    const output = await collect(run.events);
+    expect(output).toEqual([
+      { type: 'text', delta: 'continued' },
+      { type: 'done' },
+    ]);
+
+    let state = initialState;
+    for (const event of output) state = reduce(state, event);
+    const rendered = JSON.stringify(renderCard(state));
+    expect(rendered).toContain('continued');
+    expect(rendered).not.toContain('未返回内容');
+  });
+
+  it('surfaces a streamed assistant error when terminal messages were compacted', async () => {
+    const binary = await fakeOmp(`
+import { createInterface } from 'node:readline';
+console.log(JSON.stringify({ type: 'ready' }));
+const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
+for await (const line of rl) {
+  const frame = JSON.parse(line);
+  if (frame.type === 'prompt') {
+    const message = { role: 'assistant', content: [], stopReason: 'error', errorMessage: 'provider unavailable' };
+    console.log(JSON.stringify({ type: 'message_start', message }));
+    console.log(JSON.stringify({ type: 'message_end', message }));
+    // Large agent_end frames can be compacted by the OMP RPC encoder.
+    console.log(JSON.stringify({ type: 'agent_end', messages: [], isTerminal: true }));
+  }
+}
+`);
+
+    const run = new OmpAdapter({ binary }).run({ prompt: 'ping', cwd: tmpdir() });
+
+    await expect(collect(run.events)).resolves.toEqual([
+      { type: 'error', message: 'provider unavailable' },
+    ]);
+  });
+
+  it('reports a clean OMP EOF before the terminal event as an error', async () => {
+    const binary = await fakeOmp(`
+console.log(JSON.stringify({ type: 'ready' }));
+process.stdin.resume();
+setTimeout(() => process.exit(0), 10);
+`);
+
+    const run = new OmpAdapter({ binary }).run({ prompt: 'ping', cwd: tmpdir() });
+
+    await expect(collect(run.events)).resolves.toEqual([
+      { type: 'error', message: 'omp exited before terminal agent_end' },
+    ]);
   });
 
   it('keeps blocking extension UI requests interactive and accepts responses', async () => {

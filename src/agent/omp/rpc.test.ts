@@ -87,12 +87,40 @@ describe('translateOmpFrame', () => {
     ]);
 
     expect(events({ type: 'agent_end' })).toEqual([{ type: 'done' }]);
+    expect(events({ type: 'agent_end', isTerminal: false })).toEqual([]);
+  });
+
+  it('completes local-only prompts without waiting for agent_end', () => {
+    expect(events({
+      type: 'response',
+      command: 'prompt',
+      success: true,
+      data: { agentInvoked: false },
+    })).toEqual([{ type: 'done' }]);
+    expect(events({ type: 'prompt_result', agentInvoked: false })).toEqual([{ type: 'done' }]);
   });
 
   it('maps failed command responses to errors', () => {
     expect(events({ type: 'response', command: 'prompt', success: false, error: 'bad' })).toEqual([
       { type: 'error', message: 'bad' },
     ]);
+  });
+
+  it('surfaces terminal assistant errors instead of reporting an empty success', () => {
+    expect(events({
+      type: 'agent_end',
+      isTerminal: true,
+      messages: [{ role: 'assistant', stopReason: 'error', errorMessage: 'provider unavailable' }],
+    })).toEqual([{ type: 'error', message: 'provider unavailable' }]);
+
+    expect(events({
+      type: 'agent_end',
+      isTerminal: true,
+      messages: [
+        { role: 'assistant', stopReason: 'error', errorMessage: 'transient failure' },
+        { role: 'assistant', stopReason: 'stop' },
+      ],
+    })).toEqual([{ type: 'done' }]);
   });
 });
 

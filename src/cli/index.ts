@@ -63,7 +63,7 @@ program
 
 program
   .command('stop')
-  .description('Stop the OS-managed daemon (unload from launchd; plist stays)')
+  .description('Stop the OS-managed daemon and disable automatic start (service definition stays)')
   .action(async () => {
     await runServiceStop();
   });

@@ -25,8 +25,7 @@ function requireAdapter(cmdName: string): ServiceAdapter {
     console.error(
       `${cmdName}: 当前系统不支持后台运行。`,
     );
-    console.error('  目前支持: macOS (launchd) / Linux (systemd)');
-    console.error('  Windows 支持后续版本。');
+    console.error('  目前支持: macOS (launchd) / Linux (systemd) / Windows (Task Scheduler)');
     process.exit(1);
   }
   return adapter;

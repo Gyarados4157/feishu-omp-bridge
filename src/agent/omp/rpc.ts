@@ -17,12 +17,16 @@ interface OmpUsage {
 }
 
 interface OmpMessage {
+  role?: string;
   usage?: OmpUsage;
+  stopReason?: string;
+  errorMessage?: string;
 }
 
 interface OmpState {
   sessionId?: string;
   model?: OmpModel;
+  agentInvoked?: boolean;
 }
 
 interface OmpAssistantEvent {
@@ -39,6 +43,9 @@ interface OmpFrame {
   error?: string;
   data?: OmpState;
   assistantMessageEvent?: OmpAssistantEvent;
+  /** OMP sends false for an intermediate settle while a continuation is queued. */
+  isTerminal?: boolean;
+  messages?: unknown[];
   toolCallId?: string;
   toolName?: string;
   args?: unknown;
@@ -62,6 +69,7 @@ interface OmpFrame {
   widgetPlacement?: string;
   text?: string;
   url?: string;
+  agentInvoked?: boolean;
   instructions?: string;
 }
 
@@ -135,7 +143,19 @@ export function* translateOmpFrame(raw: unknown): Generator<AgentEvent> {
       }
       return;
     case 'agent_end':
-      yield { type: 'done' };
+      // Recent OMP versions use non-terminal agent_end frames for turns that
+      // are about to resume (for example, after an async continuation). Only
+      // the terminal frame ends the bridge run. Older versions omit the field,
+      // which remains terminal for backwards compatibility.
+      if (frame.isTerminal === false) return;
+      {
+        const error = terminalAssistantError(frame.messages);
+        if (error) yield { type: 'error', message: error };
+        else yield { type: 'done' };
+      }
+      return;
+    case 'prompt_result':
+      if (frame.agentInvoked === false) yield { type: 'done' };
       return;
     case 'notice':
       if (typeof frame.error === 'string') yield { type: 'error', message: frame.error };
@@ -168,6 +188,10 @@ function* translateResponse(frame: OmpFrame): Generator<AgentEvent> {
     return;
   }
 
+  if (frame.command === 'prompt' && frame.success === true && frame.data?.agentInvoked === false) {
+    yield { type: 'done' };
+    return;
+  }
   if (frame.command !== 'get_state' || frame.success !== true || !frame.data) return;
 
   const sessionId = typeof frame.data.sessionId === 'string' ? frame.data.sessionId : undefined;
@@ -184,6 +208,26 @@ function* translateMessageUpdate(evt: OmpAssistantEvent | undefined): Generator<
   if (evt.type === 'thinking_delta' && typeof evt.delta === 'string') {
     yield { type: 'thinking', delta: evt.delta };
   }
+}
+
+export function assistantMessageError(message: unknown): string | undefined {
+  if (!isRecord(message) || message.role !== 'assistant') return undefined;
+  const errorMessage = message.errorMessage;
+  if (typeof errorMessage === 'string' && errorMessage.trim()) return errorMessage;
+  if (message.stopReason === 'error' || message.stopReason === 'aborted') {
+    return 'omp assistant turn failed';
+  }
+  return undefined;
+}
+
+function terminalAssistantError(messages: unknown[] | undefined): string | undefined {
+  if (!messages) return undefined;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (!isRecord(message) || message.role !== 'assistant') continue;
+    return assistantMessageError(message);
+  }
+  return undefined;
 }
 
 function* translateExtensionUiRequest(frame: OmpFrame): Generator<AgentEvent> {
