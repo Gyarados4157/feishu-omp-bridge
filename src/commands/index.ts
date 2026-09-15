@@ -3,6 +3,7 @@ import { homedir } from 'node:os';
 import type { LarkChannel, NormalizedMessage } from '@larksuiteoapi/node-sdk';
 import type { AgentAdapter } from '../agent/types';
 import type { ActiveRuns } from '../bot/active-runs';
+import { submitMessageToRun } from '../bot/submit';
 import {
   accountCurrentCard,
   accountFailureCard,
@@ -13,6 +14,7 @@ import { configCancelledCard, configFormCard, configSavedCard } from '../card/co
 import { forgetManagedCard, sendManagedCard, updateManagedCard } from '../card/managed';
 import { helpCard, statusCard, workspacesCard } from '../card/templates';
 import type { AppConfig, MessageReplyMode, TenantBrand } from '../config/schema';
+import { getOmpCommands } from '../bot/omp-commands';
 import {
   getAgentStopGraceMs,
   getMaxConcurrentRuns,
@@ -26,6 +28,7 @@ import {
 import { setSecret } from '../config/keystore';
 import { buildEncryptedAccountConfig, saveConfig } from '../config/store';
 import { log, readRecentLogs, sanitizeLogsForDoctor } from '../core/logger';
+import type { MediaCache } from '../media/cache';
 import { renderCard } from '../card/run-renderer';
 import {
   finalizeIfRunning,
@@ -74,6 +77,8 @@ export interface CommandContext {
   workspaces: WorkspaceStore;
   agent: AgentAdapter;
   activeRuns: ActiveRuns;
+  /** Media resolver for mid-run message submission (e.g. `/queue` with attachments). */
+  media: MediaCache;
   controls: Controls;
   /** Set when invoked from a CardKit 2.0 form submit. Keys are input `name`s. */
   formValue?: Record<string, unknown>;
@@ -96,6 +101,7 @@ const handlers: Record<string, Handler> = {
   '/config': handleConfig,
   '/stop': handleStop,
   '/timeout': handleTimeout,
+  '/queue': handleQueue,
   '/ps': handlePs,
   '/exit': handleExit,
   '/doctor': handleDoctor,
@@ -360,6 +366,38 @@ async function handleStop(_args: string, ctx: CommandContext): Promise<void> {
   log.info('command', 'stop', { interrupted: ok });
   // No reply: if there was a run, its in-flight render loop will mark the
   // card as 'interrupted' and re-render (`_⏹ 已被中断_`).
+}
+
+/**
+ * `/queue <message>` — submit the payload as a FOLLOW-UP into the active run
+ * (contrast: plain messages steer, the interrupt path). The running request
+ * keeps streaming in its own card until the turn ends; only then does the
+ * queued message start a new turn, answered in a fresh card threaded to this
+ * `/queue` message.
+ */
+async function handleQueue(args: string, ctx: CommandContext): Promise<void> {
+  const text = args.trim();
+  if (!text) {
+    await reply(ctx, '用法：`/queue <消息>` —— 作为 follow-up，当前请求处理完后新卡片回答。');
+    return;
+  }
+  const ok = await submitMessageToRun(
+    {
+      channel: ctx.channel,
+      activeRuns: ctx.activeRuns,
+      media: ctx.media,
+      msg: ctx.msg,
+      scope: ctx.scope,
+    },
+    'follow_up',
+    text,
+  );
+  if (!ok) {
+    log.info('command', 'queue', { scope: ctx.scope, skipped: 'no-active-run' });
+    await reply(ctx, '当前没有进行中的请求，直接发送消息即可。');
+    return;
+  }
+  log.info('command', 'queue', { scope: ctx.scope });
 }
 
 async function handleTimeout(args: string, ctx: CommandContext): Promise<void> {
@@ -665,7 +703,7 @@ async function handleDoctor(args: string, ctx: CommandContext): Promise<void> {
 }
 
 async function handleHelp(_args: string, ctx: CommandContext): Promise<void> {
-  const card = helpCard();
+  const card = helpCard(getOmpCommands(ctx.scope));
   await ctx.channel.send(ctx.msg.chatId, { card }, { replyTo: ctx.msg.messageId });
 }
 

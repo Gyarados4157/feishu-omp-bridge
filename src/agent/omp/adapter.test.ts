@@ -66,6 +66,35 @@ for await (const line of rl) {
     await expect(run.waitForExit(100)).resolves.toBe(true);
   });
 
+  it('sends slash prompts verbatim in the initial prompt frame', async () => {
+    const binary = await fakeOmp(`
+import { createInterface } from 'node:readline';
+if (process.argv.includes('--version')) process.exit(0);
+console.log(JSON.stringify({ type: 'ready' }));
+const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
+for await (const line of rl) {
+  const frame = JSON.parse(line);
+  if (frame.type === 'get_state') {
+    console.log(JSON.stringify({ id: frame.id, type: 'response', command: 'get_state', success: true, data: { sessionId: 's', model: { provider: 'test', id: 'm' } } }));
+  }
+  if (frame.type === 'prompt') {
+    // must arrive with the leading '/' intact — no bridge conventions prefix
+    if (frame.message !== '/usage') process.exit(10);
+    console.log(JSON.stringify({ id: frame.id, type: 'response', command: 'prompt', success: true }));
+    console.log(JSON.stringify({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'ok' } }));
+    console.log(JSON.stringify({ type: 'turn_end', message: { usage: { input: 1, output: 2 } } }));
+    console.log(JSON.stringify({ type: 'agent_end' }));
+  }
+}
+`);
+
+    const run = new OmpAdapter({ binary, sessionDir: '/sessions' }).run({ prompt: '/usage', cwd: tmpdir() });
+
+    const events = await collect(run.events);
+    expect(events.some((e) => e.type === 'error')).toBe(false);
+    expect(events.some((e) => e.type === 'text' && e.delta === 'ok')).toBe(true);
+  });
+
   it('does not treat a non-terminal agent_end as the end of a run', async () => {
     const binary = await fakeOmp(`
 import { createInterface } from 'node:readline';

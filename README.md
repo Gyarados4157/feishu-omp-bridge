@@ -21,7 +21,8 @@ Bridge Feishu/Lark messages to a local [Oh My Pi (OMP)](https://github.com/can13
   - `feishu://current/context`
   - `feishu://message/<message_id>`
 - Images and files downloaded to a local cache; images are sent to OMP as RPC image content.
-- Follow-ups sent to a running chat are delivered through OMP `follow_up`; messages beginning with `!` are delivered as `steer`.
+- Messages sent to a running chat are delivered as `steer` (interrupting the current turn); `/queue <message>` schedules a follow-up answer on a fresh card after the current turn completes; OMP builtin slash commands (e.g. `/usage`, `/stats`) are executed by OMP rather than answered as text.
+- A leading `!` (e.g. `!stop thinking about that`) force-interrupts: the active run is stopped and its card marked interrupted, stale queued prompts are dropped, and the message starts a brand-new turn in a fresh run (the session is resumed, so context survives). Stronger than steer, which interrupts only from inside the same run.
 - A foreground mode and an OS-managed background daemon.
 
 ## Requirements
@@ -281,6 +282,7 @@ The QR wizard writes the app credentials and normally moves the App Secret into 
 | `/account` | Replace bot app credentials and reconnect. |
 | `/status` | Show scope, working directory, session, and agent information. |
 | `/stop` | Stop the active OMP run for this chat/topic. |
+| `/queue <message>` | Schedule the message as a follow-up, answered on a fresh card after the current turn completes. |
 | `/timeout [N\|off\|default]` | Set, disable, or reset the idle timeout for this session. `N` is `1..120` minutes. |
 | `/ps` | List bridge processes on the machine. |
 | `/exit <id\|index>` | Stop a selected bridge process; `index` is the 1-based `/ps` row number. |

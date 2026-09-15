@@ -99,11 +99,11 @@ export function statusCard(info: StatusInfo): object {
   ]);
 }
 
-export function helpCard(): object {
-  return shell('💡 使用帮助', [
+export function helpCard(ompCommands?: Array<{ name: string; description?: string }>): object {
+  const elements: object[] = [
     divMd(
       [
-        '**命令列表**',
+        '**bridge 命令**',
         '',
         '- `/new` `/reset` — 清空当前 chat 的会话',
         '- `/new chat [name]` — 新建群+新会话，自动拉你进群',
@@ -113,6 +113,8 @@ export function helpCard(): object {
         '- `/config` — 调整偏好（消息回复方式、工具调用显示）',
         '- `/status` — 当前状态',
         '- `/stop` — 结束当前正在跑的任务（也可点卡片底部 ⏹ 终止 按钮）',
+        '- `/queue <消息>` — 排入当前 run：当前请求跑完后由新卡片回答',
+        '- `!<消息>` — 强制打断当前 turn（停止 run、旧卡标中断），随后新 turn 处理该消息',
         '- `/timeout [N|off|default]` — 当前 session 的探活分钟数,`/config` 改全局默认',
         '- `/ps` — 列出本机所有 bot,标识当前正在回复的那个',
         '- `/exit <id|#>` — 关掉指定 bot(用 `/ps` 看 id/序号)',
@@ -124,16 +126,44 @@ export function helpCard(): object {
       ].join('\n'),
     ),
     HR,
+  ];
+
+  if (ompCommands && ompCommands.length > 0) {
+    elements.push(
+      divMd(
+        [
+          '**OMP 内置命令**',
+          '',
+          ...ompCommands.slice(0, 64).map((c) => `- \`/${c.name}\`${c.description ? ` — ${truncateCommandDescription(c.description)}` : ''}`),
+          ...(ompCommands.length > 64 ? [`- … 其余 ${ompCommands.length - 64} 条省略`] : []),
+          '',
+          '直接发送命令名即可由 OMP 执行（如 `/usage`）；其余内容直接交给 OMP。',
+        ].join('\n'),
+      ),
+    );
+  } else {
+    elements.push(divMd('**OMP 内置命令**\n\n（运行一次任务后，这里会列出 OMP 的内置命令）。'));
+  }
+
+  elements.push(
+    HR,
     actions([
       { text: '📊 状态', value: { cmd: 'status' }, style: 'primary' },
       { text: '📂 工作空间', value: { cmd: 'ws.list' } },
       { text: '🆕 新会话', value: { cmd: 'new' } },
     ]),
-  ]);
+  );
+  return shell('💡 使用帮助', elements);
 }
 
 function escapeMd(s: string): string {
   return s.replace(/([*_`\\])/g, '\\$1');
+}
+
+/** Trim long OMP command descriptions (skill summaries can be verbose). */
+function truncateCommandDescription(description: string, max = 80): string {
+  if (description.length <= max) return description;
+  return `${description.slice(0, max).replace(/\s+$/, '')}…`;
 }
 
 function escapeCode(s: string): string {

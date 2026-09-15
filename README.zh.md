@@ -21,7 +21,8 @@
   - `feishu://current/context`
   - `feishu://message/<message_id>`
 - 图片和文件会下载到本地缓存；图片会作为 OMP RPC image content 发送。
-- 运行中的 chat / topic 收到新消息时，普通消息通过 OMP `follow_up` 发送，以 `!` 开头的消息通过 `steer` 发送。
+- 运行中的 chat / topic 收到新消息时，普通消息作为 `steer` 进入当前 run（中断路径）；`/queue <消息>` 作为 `follow_up` 排队，当前请求完整跑完后由新卡片回答。OMP 内置命令（如 `/usage`、`/stats`）由 OMP 直接执行，不再作为普通文本交给模型。
+- 消息前加 `!`（如 `!别管这个了，先看下一个问题`）会强制打断：停止当前 run、旧卡片标记为已中断、丢弃积压队列中的旧消息，然后该消息作为全新 turn 在新 run 中处理（session 会 resume，上下文保留）。比 steer 更强——steer 只能在同一个 run 内部打断进行中的回合。
 - 同时支持前台运行和操作系统管理的后台 daemon。
 
 ## 前置条件
@@ -281,6 +282,7 @@ omp --version
 | `/account` | 更换 bot app 凭据并重连。 |
 | `/status` | 查看 scope、工作目录、session 和 agent 信息。 |
 | `/stop` | 停止当前 chat / topic 的 OMP run。 |
+| `/queue <消息>` | 把消息作为 follow-up 排入当前 run：当前请求跑完后由新卡片回答。 |
 | `/timeout [N\|off\|default]` | 设置、关闭或恢复当前 session 的 idle timeout；`N` 为 `1..120` 分钟。 |
 | `/ps` | 列出本机 bridge 进程。 |
 | `/exit <id\|序号>` | 关闭指定 bridge 进程；序号对应 `/ps` 中从 1 开始的行号。 |

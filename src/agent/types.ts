@@ -61,9 +61,15 @@ export interface AgentHostUriScheme {
   handle(req: { operation: 'read' | 'write'; url: string; content?: string }): Promise<AgentHostUriResult>;
 }
 
+export interface AgentAvailableCommand {
+  name: string;
+  aliases?: string[];
+  description?: string;
+}
+
 export type AgentEvent =
   | { type: 'system'; sessionId?: string; cwd?: string; model?: string }
-  | { type: 'text'; delta: string }
+  | { type: 'text'; delta: string; fromCommand?: boolean }
   | { type: 'thinking'; delta: string }
   | { type: 'tool_use'; id: string; name: string; input: unknown }
   | { type: 'tool_update'; id: string; output: string }
@@ -77,6 +83,8 @@ export type AgentEvent =
   | { type: 'ui_title'; title: string }
   | { type: 'ui_editor_text'; text: string }
   | { type: 'ui_open_url'; url: string; instructions?: string }
+  | { type: 'turn_start' }
+  | { type: 'available_commands'; commands: AgentAvailableCommand[] }
   | { type: 'done'; sessionId?: string }
   | { type: 'error'; message: string };
 
@@ -104,7 +112,12 @@ export interface AgentRun {
   readonly events: AsyncIterable<AgentEvent>;
   stop(): Promise<void>;
   respondToUi?(requestId: string, response: AgentUiResponse): boolean;
-  submitPrompt?(kind: 'steer' | 'follow_up', message: string, imagePaths?: string[]): Promise<boolean>;
+  submitPrompt?(
+    kind: 'steer' | 'follow_up' | 'prompt',
+    message: string,
+    imagePaths?: string[],
+    streamingBehavior?: 'steer' | 'followUp',
+  ): Promise<boolean>;
   /**
    * Wait up to `timeoutMs` for the agent process to exit on its own.
    * Resolves true if it exited within the window, false if the timer

@@ -3,6 +3,15 @@ import type { AgentRun, AgentUiResponse } from '../agent/types';
 export interface RunHandle {
   run: AgentRun;
   interrupted: boolean;
+  /**
+   * True once the agent stream reached a terminal state (or was torn down).
+   * Submission guards on this: a `follow_up` frame written after OMP emitted
+   * agent_end is queued into a dead loop and silently never consumed — the
+   * message would vanish (observed: mid-run `/usage` sent between agent_end
+   * and process reap produced no answer). Terminal runs reject submissions so
+   * the message falls back to the debounce queue / a fresh run instead.
+   */
+  terminal: boolean;
   pendingUiRequests: Set<string>;
   onUiSettled?: () => void;
   /**
@@ -11,6 +20,13 @@ export interface RunHandle {
    * threads to the message that asked for it.
    */
   pendingReplyTargets: string[];
+  /**
+   * The target (if any) reserved for the NEXT reply window. Set at a turn
+   * boundary when a queued target is consumed; the window opener reads it
+   * once and clears it. Lives on the handle so both the stream loop (which
+   * reserves it) and the window opener (which consumes it) share it.
+   */
+  currentReplyTarget?: string;
 }
 
 export class ActiveRuns {
@@ -20,6 +36,7 @@ export class ActiveRuns {
     const handle: RunHandle = {
       run,
       interrupted: false,
+      terminal: false,
       pendingUiRequests: new Set(),
       pendingReplyTargets: [],
     };
@@ -60,9 +77,19 @@ export class ActiveRuns {
     return ok;
   }
 
-  submitPrompt(chatId: string, kind: 'steer' | 'follow_up', message: string, imagePaths?: string[]): Promise<boolean> {
+  submitPrompt(
+    chatId: string,
+    kind: 'steer' | 'follow_up' | 'prompt',
+    message: string,
+    imagePaths?: string[],
+    streamingBehavior?: 'steer' | 'followUp',
+  ): Promise<boolean> {
     const h = this.handles.get(chatId);
-    return h?.run.submitPrompt?.(kind, message, imagePaths) ?? Promise.resolve(false);
+    // No run, or a run whose stream already ended: writing a frame now would
+    // queue the text into an engine that will never deliver it. Return false
+    // so the caller routes the message through the debounce queue / new run.
+    if (!h || h.terminal) return Promise.resolve(false);
+    return h.run.submitPrompt?.(kind, message, imagePaths, streamingBehavior) ?? Promise.resolve(false);
   }
   /**
    * Record the Feishu message that triggered a follow-up turn. The running

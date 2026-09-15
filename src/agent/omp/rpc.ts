@@ -1,6 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { extname } from 'node:path';
-import type { AgentEvent, AgentUiNoticeType } from '../types';
+import type { AgentAvailableCommand, AgentEvent, AgentUiNoticeType } from '../types';
 
 interface OmpModel {
   provider?: string;
@@ -62,6 +62,7 @@ interface OmpFrame {
   promptStyle?: boolean;
   targetId?: string;
   notifyType?: string;
+  commands?: unknown;
   statusKey?: string;
   statusText?: string;
   widgetKey?: string;
@@ -137,6 +138,31 @@ export function* translateOmpFrame(raw: unknown): Generator<AgentEvent> {
         };
       }
       return;
+    case 'turn_start':
+      // Turn boundary marker: the agent started a NEW turn (a fresh user
+      // message is being answered). The bridge uses this to rotate reply
+      // windows at the real request boundary instead of on the first event
+      // after a follow-up was queued (which is still the old turn's tail).
+      yield { type: 'turn_start' };
+      return;
+    case 'command_output':
+      // Slash commands (e.g. `/compact`, `/usage`, `/stats`) report their
+      // result through this frame. A builtin command runs no agent turn, so
+      // OMP emits no `turn_start` — emit one here so the reply window
+      // rotates to the slash message instead of appending to the previous
+      // card. NOTE: no terminal event is emitted on purpose — the OMP RPC
+      // process stays alive to serve the next prompt (and any subprocess a
+      // command spawned, e.g. /stats' dashboard, must not be reaped); it
+      // stays the chat's active run until the next turn rotates its window
+      // or the user stops it / the idle watchdog fires.
+      if (typeof frame.text === 'string') {
+        yield { type: 'turn_start' };
+        yield { type: 'text', delta: frame.text, fromCommand: true };
+      }
+      return;
+    case 'available_commands_update':
+      yield* translateAvailableCommands(frame.commands);
+      return;
     case 'turn_end':
       if (isRecord(frame.message) && isRecord(frame.message.usage)) {
         yield usageEvent(frame.message.usage as OmpUsage);
@@ -208,6 +234,20 @@ function* translateMessageUpdate(evt: OmpAssistantEvent | undefined): Generator<
   if (evt.type === 'thinking_delta' && typeof evt.delta === 'string') {
     yield { type: 'thinking', delta: evt.delta };
   }
+}
+
+function* translateAvailableCommands(value: unknown): Generator<AgentEvent> {
+  if (!Array.isArray(value)) return;
+  const commands: AgentAvailableCommand[] = [];
+  for (const item of value) {
+    if (!isRecord(item) || typeof item.name !== 'string') continue;
+    commands.push({
+      name: item.name,
+      aliases: stringArrayOrUndefined(item.aliases),
+      description: typeof item.description === 'string' ? item.description : undefined,
+    });
+  }
+  if (commands.length > 0) yield { type: 'available_commands', commands };
 }
 
 export function assistantMessageError(message: unknown): string | undefined {
