@@ -34,20 +34,21 @@ import {
 } from '../config/schema';
 import { resolveAppSecret } from '../config/secret-resolver';
 import { log, withTrace } from '../core/logger';
-import { MediaCache, type LocalAttachment } from '../media/cache';
+import { MediaCache } from '../media/cache';
 import type { SessionStore } from '../session/store';
 import type { WorkspaceStore } from '../workspace/store';
 import { ActiveRuns, type RunHandle } from './active-runs';
 import { ChatModeCache, type ChatMode } from './chat-mode-cache';
 import { handleCommentMention } from './comments';
 import { createFeishuHostIntegration } from './feishu-host';
-import { expandInteractiveCard } from './interactive-card';
 import { startKeepalive } from './keepalive';
 import { configureNetwork } from './network-config';
+import { setOmpCommands } from './omp-commands';
 import { PendingQueue } from './pending-queue';
 import { ProcessPool } from './process-pool';
-import { fetchQuotedContext, renderQuotedBlock, type QuotedContext } from './quote';
+import { fetchQuotedContext, type QuotedContext } from './quote';
 import { addWorkingReaction, removeReaction } from './reaction';
+import { buildPrompt, submitMessageToRun } from './submit';
 
 const DEBOUNCE_MS = 600;
 // Feishu CardKit streaming (markdown mode) cards auto-close ~10 minutes
@@ -256,6 +257,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           workspaces,
           activeRuns,
           agent,
+          media,
           controls,
           pending,
           chatModeCache,
@@ -429,6 +431,7 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     workspaces,
     agent,
     activeRuns,
+    media,
     controls,
   });
   if (handled) {
@@ -437,41 +440,35 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     return;
   }
 
-  if (await submitToActiveRun({ channel, activeRuns, media, msg, scope })) {
+  // `!` prefix: force-interrupt the current turn, then process the message
+  // as a FRESH turn once the old run is torn down. Stronger than steer —
+  // steer only interrupts an in-flight OMP turn from inside the same run;
+  // this also stops the run, marks its card interrupted, drops stale queued
+  // prompts, and the message starts a brand-new run (session resumed, so
+  // context survives). The pending queue is blocked while the old run is
+  // being stopped, so the new turn only starts after it exits.
+  const rawText = msg.content.trimStart();
+  if (rawText.startsWith('!') && rawText.length > 1) {
+    const interrupted = activeRuns.interrupt(scope);
+    pending.cancel(scope);
+    const rest = rawText.slice(1).trimStart();
+    if (rest) {
+      pending.push(scope, { ...msg, content: rest });
+      log.info('intake', 'interrupt-new-turn', { scope, interrupted, restChars: rest.length });
+    } else {
+      log.info('intake', 'interrupt-only', { scope, interrupted });
+    }
+    return;
+  }
+
+  // Default mid-run messages are STEER (interrupt path) — no prefix needed.
+  if (await submitMessageToRun({ channel, activeRuns, media, msg, scope }, 'steer')) {
     log.info('intake', 'submitted-active-run', { scope });
     return;
   }
 
   const size = pending.push(scope, msg);
   log.info('intake', 'queued', { scope, queueSize: size, debounceMs: DEBOUNCE_MS });
-}
-
-async function submitToActiveRun(deps: {
-  channel: LarkChannel;
-  activeRuns: ActiveRuns;
-  media: MediaCache;
-  msg: NormalizedMessage;
-  scope: string;
-}): Promise<boolean> {
-  const { channel, activeRuns, media, msg, scope } = deps;
-  if (!activeRuns.has(scope)) return false;
-  const resources = msg.resources.map((resource) => ({ messageId: msg.messageId, resource }));
-  const attachments = await media.resolve(msg.chatId, resources);
-  const imagePaths = attachments.filter((attachment) => attachment.kind === 'image').map((attachment) => attachment.path);
-  const quotes: QuotedContext[] = [];
-  if (msg.replyToMessageId) {
-    const quote = await fetchQuotedContext(channel, msg.replyToMessageId);
-    if (quote) quotes.push(quote);
-  }
-  const prompt = buildPrompt([msg], attachments, quotes);
-  const trimmed = msg.content.trimStart();
-  const kind = trimmed.startsWith('!') ? 'steer' : 'follow_up';
-  const submitted = await activeRuns.submitPrompt(scope, kind, prompt, imagePaths);
-  // The follow-up turn's answer must land in a NEW reply window threaded to
-  // this message, not appended to the previous reply. Queue it so that
-  // window's reply targets this message.
-  if (submitted) activeRuns.queueReplyTarget(scope, msg.messageId);
-  return submitted;
 }
 
 interface RunBatchDeps {
@@ -548,7 +545,13 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     }
   }
 
-  const prompt = buildPrompt(batch, attachments, quotes);
+  // A single slash command (e.g. `/compact`) starting a fresh run must reach
+  // OMP verbatim — the `<bridge_context>` wrapper would hide the leading `/`
+  // from the slash parser. Multi-message batches / attached / quoted messages
+  // keep the normal prompt (a slash command can't be the first token then).
+  const firstText = batch.length === 1 ? (batch[0]?.content ?? '').trimStart() : '';
+  const isSoloSlash = batch.length === 1 && attachments.length === 0 && quotes.length === 0 && firstText.startsWith('/');
+  const prompt = isSoloSlash ? firstText : buildPrompt(batch, attachments, quotes);
   log.info('prompt', 'built', { promptChars: prompt.length, quotes: quotes.length });
 
   const cwd = workspaces.cwdFor(scope) ?? homedir();
@@ -632,6 +635,8 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     /** Original message this window's reply threads to — kept across
      * time-based rotation so rollover cards form one continuous reply. */
     replyTo: string;
+    /** When the window was opened (time-based rotation age). */
+    openedAt: number;
   }
 
   const openWindow = (replyTo: string, initialCard: object): StreamWindow => {
@@ -682,8 +687,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     done.catch(() => {
       /* observed */
     });
-    windowOpenedAt = Date.now();
-    return { ctrl: ctrlGate, done, finish, painted: false, replyTo };
+    return { ctrl: ctrlGate, done, finish, painted: false, replyTo, openedAt: Date.now() };
   };
 
   // Merge the per-window content (current turn's blocks/reasoning) with the
@@ -699,7 +703,6 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
 
   let window: StreamWindow | undefined;
   let windowFailed = false;
-  let windowOpenedAt = 0;
   // End a window the same way the final flush does: release the producer,
   // wait for the SDK to complete the card, and recall it if it never
   // received content. Used by finalizeWindow and time-based rotation.
@@ -718,21 +721,12 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   const flushView = async (view: RunState, live: RunState): Promise<void> => {
     if (windowFailed) return;
     const rendered = renderWindowState(view, live);
-    if (!window) {
-      // Only ever open a window once there is content to show. Opening one
-      // early risks a "(no content)" card when it is finalized.
-      const hasContent = view.blocks.length > 0 || view.reasoning.content.length > 0;
-      if (!hasContent) return;
-      const replyTo = handle.pendingReplyTargets.shift() ?? lastMsg.messageId;
-      window = openWindow(
-        replyTo,
-        renderCard({ ...rendered, blocks: [], reasoning: { content: '', active: false } }),
-      );
-    } else if (replyMode === 'markdown' && Date.now() - windowOpenedAt > STREAMING_WINDOW_MAX_AGE_MS) {
-      // Over-age streaming card: CardKit closed it ~10 min after creation and
-      // later updates are silently dropped, so a long run would freeze the
-      // card and lose its final answer. Finalize it and continue in a fresh
-      // window threaded to the same original message.
+
+    // Over-age streaming card in markdown mode: CardKit closed it ~10 min
+    // after creation and later updates are silently dropped, so a long run
+    // would freeze the card and lose its final answer. Finalize it and
+    // continue in a fresh window threaded to the same original message.
+    if (window && replyMode === 'markdown' && Date.now() - window.openedAt > STREAMING_WINDOW_MAX_AGE_MS) {
       const seg = window;
       window = undefined;
       try {
@@ -740,8 +734,21 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       } catch (err) {
         log.fail('window', err, { step: 'rotate-finalize' });
       }
-      log.info('window', 'rotated', { ageMs: Date.now() - windowOpenedAt });
+      log.info('window', 'rotated', { ageMs: Date.now() - seg.openedAt });
       window = openWindow(seg.replyTo, renderCard(initialState));
+    }
+
+    // Open a window only once there is content to show. Opening one early
+    // risks a "(no content)" card when it is finalized.
+    if (!window) {
+      const hasContent = view.blocks.length > 0 || view.reasoning.content.length > 0;
+      if (!hasContent) return;
+      const replyTo = handle.currentReplyTarget ?? lastMsg.messageId;
+      handle.currentReplyTarget = undefined;
+      window = openWindow(
+        replyTo,
+        renderCard({ ...rendered, blocks: [], reasoning: { content: '', active: false } }),
+      );
     }
     try {
       const ctrl = await window.ctrl;
@@ -863,6 +870,11 @@ async function processAgentStream(
   // Per-window render accumulation. Reset when a follow-up prompt is queued
   // so the follow-up's answer starts in a fresh window.
   let view: RunState = initialState;
+  // True when the CURRENT window's turn consists of slash-builtin output
+  // (synthetic text). Such a turn has no `done`, so when the next turn
+  // boundary rotates the window, finalize the old card as completed instead
+  // of leaving it stuck on "streaming…".
+  let lastTurnWasCommand = false;
 
   // Idle watchdog: OMP going silent for `idleTimeoutMs` is treated as
   // "presumed hung", we stop() and surface a timeout marker on the card.
@@ -921,14 +933,35 @@ async function processAgentStream(
       }
       armOrPauseIdle();
 
-      // New-user-prompt boundary: a follow-up was queued (submitToActiveRun
-      // enqueues the reply target synchronously after the prompt write, so
-      // the queue is non-empty before OMP can emit any event for the
-      // follow-up turn). Finalize the current reply window and reset the
-      // per-window view so this event starts the follow-up turn fresh.
-      if (handle.pendingReplyTargets.length > 0) {
+      // New-user-TURN boundary. OMP delivers a queued steer/follow-up as a
+      // brand-new turn; `turn_start` is the first event of that turn. All
+      // events before it (the tail of the previous turn — remaining tool
+      // calls, last streamed tokens) still belong to the PREVIOUS request,
+      // so we must not rotate earlier or the new card would mix in the old
+      // answer. The old card keeps showing the old request until this turn
+      // boundary, exactly as follow-ups are meant to feel.
+      //
+      // `turn_start` is the ONLY boundary event the stream can produce —
+      // slash builtin output arrives as `command_output`, but rpc.ts turns
+      // that into a synthetic `turn_start` first (see translateOmpFrame),
+      // so this single condition covers both agent turns and slash commands.
+      if (evt.type === 'turn_start' && handle.pendingReplyTargets.length > 0) {
+        // The previous window was a slash-builtin turn: it finished emitting
+        // its output but never saw a `done`. Render it as completed BEFORE
+        // rotating, or the old card would keep showing "streaming…" forever.
+        if (lastTurnWasCommand) {
+          // Completed presentation lives on the live side — renderWindowState
+          // reads footer/terminal from `live`, not `view`.
+          await flush(view, { ...state, footer: null, terminal: 'done' });
+        }
+        lastTurnWasCommand = false;
         view = initialState;
+        handle.currentReplyTarget = handle.pendingReplyTargets.shift();
         await onBoundary?.();
+      }
+
+      if (evt.type === 'text' && evt.fromCommand) {
+        lastTurnWasCommand = true;
       }
 
       if (evt.type === 'system') {
@@ -943,6 +976,10 @@ async function processAgentStream(
         if (evt.costUsd !== undefined) {
           log.info('agent', 'usage', { costUsd: Number(evt.costUsd.toFixed(4)) });
         }
+        continue;
+      }
+      if (evt.type === 'available_commands') {
+        setOmpCommands(scope, evt.commands);
         continue;
       }
       if (evt.type === 'ui_request') {
@@ -965,8 +1002,23 @@ async function processAgentStream(
       if (state.terminal !== 'running') break;
     }
   } finally {
+    // From here on the run cannot consume submitted frames — the agent loop
+    // has ended even if the subprocess is still being reaped. Terminal
+    // submissions are rejected so messages fall back to a fresh run instead
+    // of vanishing into a dead queue.
+    handle.terminal = true;
     if (handle.onUiSettled === armOrPauseIdle) handle.onUiSettled = undefined;
     if (timer) clearTimeout(timer);
+  }
+
+  // A queued reply target that never got its own turn means OMP ended the
+  // run before processing the message (e.g. agent_end raced the frame write).
+  // Surface it so lost inputs are visible instead of silently dropped.
+  if (handle.pendingReplyTargets.length > 0) {
+    log.warn('window', 'unconsumed-reply-targets', {
+      scope,
+      count: handle.pendingReplyTargets.length,
+    });
   }
 
   // If state already reached a terminal event (done/error/etc.) before the
@@ -1008,81 +1060,4 @@ async function processAgentStream(
  * a stall (the card has already rendered terminal state by this point).
  */
 const POST_DONE_EXIT_GRACE_MS = 2000;
-
-/**
- * For interactive-card messages the SDK flattens to text-bearing nodes or
- * the literal "[interactive card]" placeholder, losing v2 `user_dsl` and the
- * raw v1 JSON. Pull the raw webhook content (attached via `includeRawEvent`)
- * and feed it to `expandInteractiveCard` so direct-receive cards get the
- * same `<interactive_card>` injection that quoted cards already get.
- */
-function expandedMessageContent(m: NormalizedMessage): string {
-  if (m.rawContentType !== 'interactive') return m.content;
-  const rawContent = (m.raw as { message?: { content?: unknown } } | undefined)
-    ?.message?.content;
-  if (typeof rawContent !== 'string') return m.content;
-  return expandInteractiveCard(m.content, rawContent);
-}
-
-function buildPrompt(
-  batch: NormalizedMessage[],
-  attachments: LocalAttachment[],
-  quotes: QuotedContext[] = [],
-): string {
-  const fileKeys = batch.flatMap((m) => m.resources.map((r) => r.fileKey));
-  const texts = batch
-    .map((m) => stripAttachmentRefs(expandedMessageContent(m), fileKeys).trim())
-    .filter(Boolean);
-  const ctxHeader = buildBridgeContextHeader(batch);
-  const quoteBlock = renderQuotedBlock(quotes);
-
-  // Order: <bridge_context> (metadata) → <quoted_message>(s) (what user is
-  // pointing at) → user text + attachments (what they're asking).
-  const prefixParts = [ctxHeader, quoteBlock].filter(Boolean);
-  const prefix = prefixParts.length > 0 ? `${prefixParts.join('\n\n')}\n\n` : '';
-
-  if (attachments.length === 0) {
-    return `${prefix}${texts.join('\n\n')}`;
-  }
-
-  const attachLines = attachments.map((a) => {
-    const label =
-      a.kind === 'image'
-        ? '图片'
-        : a.kind === 'audio'
-          ? '音频'
-          : a.kind === 'video'
-            ? '视频'
-            : '文件';
-    const name = a.originalName ? ` (${a.originalName})` : '';
-    return `- ${a.path}${name} — ${label}`;
-  });
-  const userPart = texts.length > 0 ? texts.join('\n\n') : '请看下面的附件。';
-  return `${prefix}${userPart}\n\n附件（本地路径）：\n${attachLines.join('\n')}`;
-}
-
-function buildBridgeContextHeader(batch: NormalizedMessage[]): string {
-  const m = batch[0];
-  if (!m) return '';
-  const lines = [
-    '<bridge_context>',
-    `chat_id: ${m.chatId}`,
-    `chat_type: ${m.chatType}`,
-    `sender_id: ${m.senderId}`,
-  ];
-  if (m.senderName) lines.push(`sender_name: ${m.senderName}`);
-  if (m.threadId) lines.push(`thread_id: ${m.threadId}`);
-  lines.push('</bridge_context>');
-  return lines.join('\n');
-}
-
-function stripAttachmentRefs(text: string, fileKeys: string[]): string {
-  if (!text || fileKeys.length === 0) return text;
-  let out = text;
-  for (const key of fileKeys) {
-    const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    out = out.replace(new RegExp(`!?\\[[^\\]]*\\]\\(${escaped}\\)`, 'g'), '');
-  }
-  return out.replace(/\n{3,}/g, '\n\n');
-}
 

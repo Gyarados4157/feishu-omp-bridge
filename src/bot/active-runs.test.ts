@@ -56,6 +56,31 @@ describe('ActiveRuns OMP UI routing', () => {
     expect(activeRuns.has('scope-1')).toBe(true);
     expect(prompts).toEqual([{ kind: 'follow_up', message: 'next', imagePaths: ['a.png'] }]);
   });
+
+  it('rejects submissions once the run stream has ended (terminal guard)', async () => {
+    // Writing a follow_up/prompt frame into a run whose stream already ended
+    // queues the text into a dead loop that never delivers it — the message
+    // would vanish silently. The terminal guard returns false so callers
+    // route the message through the debounce queue / a fresh run instead.
+    const activeRuns = new ActiveRuns();
+    let submitted = 0;
+    const run: AgentRun = {
+      events: emptyEvents(),
+      stop: async () => {},
+      waitForExit: async () => true,
+      async submitPrompt() {
+        submitted += 1;
+        return true;
+      },
+    };
+
+    const handle = activeRuns.register('scope-1', run);
+    handle.terminal = true;
+
+    await expect(activeRuns.submitPrompt('scope-1', 'follow_up', 'next')).resolves.toBe(false);
+    expect(activeRuns.submitPrompt('scope-1', 'prompt', '/usage')).resolves.toBe(false);
+    expect(submitted).toBe(0);
+  });
   it('queues follow-up reply targets in submission order', () => {
     const activeRuns = new ActiveRuns();
     const run: AgentRun = {

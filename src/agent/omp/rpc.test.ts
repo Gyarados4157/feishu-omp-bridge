@@ -100,6 +100,10 @@ describe('translateOmpFrame', () => {
     expect(events({ type: 'prompt_result', agentInvoked: false })).toEqual([{ type: 'done' }]);
   });
 
+  it('maps turn_start to the turn boundary marker', () => {
+    expect(events({ type: 'turn_start' })).toEqual([{ type: 'turn_start' }]);
+  });
+
   it('maps failed command responses to errors', () => {
     expect(events({ type: 'response', command: 'prompt', success: false, error: 'bad' })).toEqual([
       { type: 'error', message: 'bad' },
@@ -176,6 +180,41 @@ describe('loadOmpImages', () => {
 
     await expect(loadOmpImages([path])).resolves.toEqual([
       { type: 'image', data: 'AQID', mimeType: 'image/png' },
+    ]);
+  });
+});
+
+describe('available_commands_update', () => {
+  it('maps the frame to an available_commands event', () => {
+    const events = [...translateOmpFrame({
+      type: 'available_commands_update',
+      commands: [
+        { name: '/compact', description: 'Compact the conversation' },
+        { name: '/foo', aliases: ['/f'], description: undefined },
+        { name: 42 },
+      ],
+    })];
+    expect(events).toEqual([
+      {
+        type: 'available_commands',
+        commands: [
+          { name: '/compact', aliases: undefined, description: 'Compact the conversation' },
+          { name: '/foo', aliases: ['/f'], description: undefined },
+        ],
+      },
+    ]);
+  });
+
+  it('yields nothing for a missing commands array', () => {
+    expect([...translateOmpFrame({ type: 'available_commands_update' })]).toEqual([]);
+  });
+});
+
+describe('command_output', () => {
+  it('opens a turn boundary and surfaces slash command output as text deltas', () => {
+    expect([...translateOmpFrame({ type: 'command_output', text: 'Compaction complete.' })]).toEqual([
+      { type: 'turn_start' },
+      { type: 'text', delta: 'Compaction complete.', fromCommand: true },
     ]);
   });
 });

@@ -6,6 +6,7 @@ import type { PendingQueue } from '../bot/pending-queue';
 import { runCommandHandler, type CommandContext, type Controls } from '../commands';
 import { isChatAllowed, isUserAllowed } from '../config/schema';
 import { log } from '../core/logger';
+import type { MediaCache } from '../media/cache';
 import type { SessionStore } from '../session/store';
 import { updateManagedCard } from './managed';
 import {
@@ -32,6 +33,7 @@ export interface CardDispatchDeps {
   workspaces: WorkspaceStore;
   activeRuns: ActiveRuns;
   agent: AgentAdapter;
+  media: MediaCache;
   controls: Controls;
   pending: PendingQueue;
   chatModeCache: ChatModeCache;
@@ -106,6 +108,7 @@ export async function handleCardAction(deps: CardDispatchDeps): Promise<void> {
     workspaces: deps.workspaces,
     activeRuns: deps.activeRuns,
     agent: deps.agent,
+    media: deps.media,
     controls: deps.controls,
     formValue,
     fromCardAction: true,

@@ -124,13 +124,33 @@ export class OmpAdapter implements AgentAdapter {
         if (child.exitCode !== null || child.signalCode !== null) return false;
         return writeFrame(child, { type: 'extension_ui_response', id: requestId, ...response });
       },
-      async submitPrompt(kind: 'steer' | 'follow_up', message: string, imagePaths?: string[]): Promise<boolean> {
+      async submitPrompt(
+        kind: 'steer' | 'follow_up' | 'prompt',
+        message: string,
+        imagePaths?: string[],
+        streamingBehavior?: 'steer' | 'followUp',
+      ): Promise<boolean> {
         if (child.exitCode !== null || child.signalCode !== null) return false;
         const images = await loadOmpImages(imagePaths);
+        // The `prompt` frame runs OMP's slash-command dispatch (builtin /
+        // extension / file / skill commands) before falling back to a plain
+        // session.prompt; steer/follow_up frames never do. The message must
+        // be the VERBATIM user text — the conventions prefix would hide the
+        // leading `/` from the slash parser. `streamingBehavior` preserves the
+        // caller's interrupt-vs-queue semantics when OMP is already streaming:
+        // prompt+behavior mirrors the TUI's Enter (= steer) / Ctrl+Enter
+        // (= follow-up).
+        const frame =
+          kind === 'prompt'
+            ? {
+                id: `prompt_${Date.now()}`,
+                type: 'prompt' as const,
+                message,
+                streamingBehavior,
+              }
+            : { id: `${kind}_${Date.now()}`, type: kind, message: buildOmpPrompt(message) };
         return writeFrame(child, {
-          id: `${kind}_${Date.now()}`,
-          type: kind,
-          message: buildOmpPrompt(message),
+          ...frame,
           ...(images.length > 0 ? { images } : {}),
         });
       },
@@ -191,7 +211,10 @@ async function* createEventStream(
           writeFrameOrThrow(child, {
             id: 'prompt_1',
             type: 'prompt',
-            message: buildOmpPrompt(opts.prompt),
+            message:
+              opts.prompt.trimStart().startsWith('/')
+                ? opts.prompt
+                : buildOmpPrompt(opts.prompt),
             ...(images.length > 0 ? { images } : {}),
           });
           promptSent = true;
